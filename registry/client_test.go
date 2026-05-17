@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -218,6 +220,149 @@ func TestWatcherReconnectsWithSinceRevision(t *testing.T) {
 	}
 }
 
+func TestWatcherIgnoresPingEvents(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: ping\n"))
+		_, _ = w.Write([]byte("data: {}\n\n"))
+		_, _ = w.Write([]byte("id: 14\n"))
+		_, _ = w.Write([]byte("event: upsert\n"))
+		_, _ = w.Write([]byte("data: {\"revision\":14,\"type\":\"upsert\",\"namespace\":\"prod\",\"service\":\"company.trade.order.order-center.api\",\"instanceId\":\"order-center-api-2\"}\n\n"))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, WithWatchReconnectInterval(10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	watcher := client.WatchInstances(ctx, WatchOptions{
+		QueryOptions: QueryOptions{
+			Namespace: "prod",
+			Service:   "company.trade.order.order-center.api",
+		},
+	})
+	defer watcher.Close()
+
+	select {
+	case event, ok := <-watcher.Events():
+		if !ok {
+			t.Fatalf("watcher closed unexpectedly: %v", watcher.Err())
+		}
+		if event.Type != WatchEventUpsert || event.Revision != 14 {
+			t.Fatalf("unexpected event after ping: %+v", event)
+		}
+	case <-ctx.Done():
+		t.Fatalf("wait watch event timeout: %v", ctx.Err())
+	}
+}
+
+func TestWatcherDisablesHTTPClientOverallTimeout(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(80 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("id: 15\n"))
+		_, _ = w.Write([]byte("event: upsert\n"))
+		_, _ = w.Write([]byte("data: {\"revision\":15,\"type\":\"upsert\",\"namespace\":\"prod\",\"service\":\"company.trade.order.order-center.api\",\"instanceId\":\"order-center-api-3\"}\n\n"))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, WithHTTPClient(&http.Client{Timeout: 30 * time.Millisecond}))
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	watcher := client.WatchInstances(ctx, WatchOptions{
+		QueryOptions: QueryOptions{
+			Namespace: "prod",
+			Service:   "company.trade.order.order-center.api",
+		},
+		ReconnectInterval: 10 * time.Millisecond,
+	})
+	defer watcher.Close()
+
+	select {
+	case event, ok := <-watcher.Events():
+		if !ok {
+			t.Fatalf("watcher closed unexpectedly: %v", watcher.Err())
+		}
+		if event.Type != WatchEventUpsert || event.Revision != 15 {
+			t.Fatalf("unexpected watch event: %+v", event)
+		}
+	case <-ctx.Done():
+		t.Fatalf("wait watch event timeout: %v", ctx.Err())
+	}
+}
+
+func TestWatcherReconnectsAfterIdleTimeout(t *testing.T) {
+	t.Parallel()
+
+	var requestCount atomic.Int32
+	client, err := NewClient("http://stellmap.local", WithHTTPClient(&http.Client{
+		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			if requestCount.Add(1) == 1 {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       timeoutReadCloser{},
+					Request:    r,
+				}, nil
+			}
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body: io.NopCloser(strings.NewReader(
+					"id: 16\n" +
+						"event: upsert\n" +
+						"data: {\"revision\":16,\"type\":\"upsert\",\"namespace\":\"prod\",\"service\":\"company.trade.order.order-center.api\",\"instanceId\":\"order-center-api-4\"}\n\n",
+				)),
+				Request: r,
+			}, nil
+		}),
+	}))
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	watcher := client.WatchInstances(ctx, WatchOptions{
+		QueryOptions: QueryOptions{
+			Namespace: "prod",
+			Service:   "company.trade.order.order-center.api",
+		},
+		ReconnectInterval: 10 * time.Millisecond,
+	})
+	defer watcher.Close()
+
+	select {
+	case event, ok := <-watcher.Events():
+		if !ok {
+			t.Fatalf("watcher closed unexpectedly: %v", watcher.Err())
+		}
+		if event.Type != WatchEventUpsert || event.Revision != 16 {
+			t.Fatalf("unexpected watch event after reconnect: %+v", event)
+		}
+	case <-ctx.Done():
+		t.Fatalf("wait watch event timeout: %v", ctx.Err())
+	}
+	if requestCount.Load() < 2 {
+		t.Fatalf("expected reconnect after idle timeout, got %d request(s)", requestCount.Load())
+	}
+}
+
 func TestRegistrarSendsHeartbeatAndDeregister(t *testing.T) {
 	t.Parallel()
 
@@ -286,6 +431,36 @@ func TestRegistrarSendsHeartbeatAndDeregister(t *testing.T) {
 	if deregisterCount.Load() != 1 {
 		t.Fatalf("unexpected deregister count: %d", deregisterCount.Load())
 	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+type timeoutReadCloser struct{}
+
+func (timeoutReadCloser) Read([]byte) (int, error) {
+	return 0, timeoutError{}
+}
+
+func (timeoutReadCloser) Close() error {
+	return nil
+}
+
+type timeoutError struct{}
+
+func (timeoutError) Error() string {
+	return "idle timeout"
+}
+
+func (timeoutError) Timeout() bool {
+	return true
+}
+
+func (timeoutError) Temporary() bool {
+	return true
 }
 
 func waitUntil(t *testing.T, timeout time.Duration, predicate func() bool) {

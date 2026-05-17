@@ -98,7 +98,7 @@ func (w *Watcher) run() {
 		if err == nil {
 			return
 		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(w.ctx.Err(), context.Canceled) {
+		if w.ctx.Err() != nil {
 			return
 		}
 
@@ -164,12 +164,12 @@ func (w *Watcher) consumeStream(options WatchOptions, sinceRevision uint64) (uin
 	}
 	headers["Accept"] = "text/event-stream"
 
-	response, err := w.client.doRaw(w.ctx, requestSpec{
+	response, err := w.client.doRawWithHTTPClient(w.ctx, requestSpec{
 		Method: http.MethodGet,
 		Path:   routeRegistryWatch,
 		Query:  values,
 		Header: headers,
-	}, false)
+	}, false, w.client.watchHTTPClient())
 	if err != nil {
 		return sinceRevision, err
 	}
@@ -185,7 +185,7 @@ func (w *Watcher) consumeStream(options WatchOptions, sinceRevision uint64) (uin
 			}
 			return currentRevision, err
 		}
-		if len(message.Data) == 0 || message.Event == "" {
+		if len(message.Data) == 0 || message.Event == "" || isWatchPingMessage(message) {
 			continue
 		}
 
@@ -245,6 +245,15 @@ func readSSEMessage(reader *bufio.Reader) (sseMessage, error) {
 			continue
 		}
 		applySSELine(&message, line)
+	}
+}
+
+func isWatchPingMessage(message sseMessage) bool {
+	switch strings.ToLower(strings.TrimSpace(message.Event)) {
+	case "ping", "heartbeat", "keepalive":
+		return true
+	default:
+		return false
 	}
 }
 

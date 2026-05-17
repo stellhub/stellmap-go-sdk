@@ -235,7 +235,11 @@ func (c *Client) doEnvelope(ctx context.Context, method, path string, query url.
 }
 
 func (c *Client) doRaw(ctx context.Context, spec requestSpec, retryNotLeader bool) (*http.Response, error) {
-	response, err := c.doRawOnce(ctx, spec)
+	return c.doRawWithHTTPClient(ctx, spec, retryNotLeader, c.httpClient)
+}
+
+func (c *Client) doRawWithHTTPClient(ctx context.Context, spec requestSpec, retryNotLeader bool, httpClient *http.Client) (*http.Response, error) {
+	response, err := c.doRawOnceWithHTTPClient(ctx, spec, httpClient)
 	if err == nil {
 		return response, nil
 	}
@@ -250,16 +254,23 @@ func (c *Client) doRaw(ctx context.Context, spec requestSpec, retryNotLeader boo
 		return nil, buildErr
 	}
 	spec.BaseURL = leaderBaseURL
-	return c.doRawOnce(ctx, spec)
+	return c.doRawOnceWithHTTPClient(ctx, spec, httpClient)
 }
 
 func (c *Client) doRawOnce(ctx context.Context, spec requestSpec) (*http.Response, error) {
+	return c.doRawOnceWithHTTPClient(ctx, spec, c.httpClient)
+}
+
+func (c *Client) doRawOnceWithHTTPClient(ctx context.Context, spec requestSpec, httpClient *http.Client) (*http.Response, error) {
 	request, err := c.newRequest(ctx, spec)
 	if err != nil {
 		return nil, err
 	}
 
-	response, err := c.httpClient.Do(request)
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	response, err := httpClient.Do(request)
 	if err != nil {
 		return nil, err
 	}
@@ -269,6 +280,16 @@ func (c *Client) doRawOnce(ctx context.Context, spec requestSpec) (*http.Respons
 
 	defer response.Body.Close()
 	return nil, c.decodeAPIError(response)
+}
+
+func (c *Client) watchHTTPClient() *http.Client {
+	if c.httpClient == nil {
+		return http.DefaultClient
+	}
+
+	watchClient := *c.httpClient
+	watchClient.Timeout = 0
+	return &watchClient
 }
 
 func (c *Client) newRequest(ctx context.Context, spec requestSpec) (*http.Request, error) {
